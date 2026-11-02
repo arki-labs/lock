@@ -1,0 +1,1035 @@
+{
+  "package": "@arki/lock",
+  "version": "0.2.1",
+  "entries": [
+    {
+      "subpath": ".",
+      "name": "AcquireRequest",
+      "kind": "type",
+      "signature": "export type AcquireRequest = { /** Fresh per attempt, so a late grant can only give back its own lock. */ readonly token: LockToken; /** Lease stores: how long the lock lasts without renewal. */ readonly ttlMs?: number; /** Stores with `wait: 'native'`: block up to this long inside the store. Absent = one attempt. */ readonly waitMs?: number; readonly signal?: AbortSignal; /** * The caller's wait (from `waiter()`), on its attempts after the first refusal. A store that * hands a freed lock straight to a waiter grants it only to that waiter's attempt. */ readonly waiter?: Waiter; };",
+      "jsdocSummary": "One atomic attempt on a mutex key."
+    },
+    {
+      "subpath": ".",
+      "name": "createLocks",
+      "kind": "function",
+      "signature": "export declare function createLocks<S extends Store>(options: CreateLocksOptions<S>): Locks<S>;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "CreateLocksOptions",
+      "kind": "type",
+      "signature": "export type CreateLocksOptions<S extends Store> = { readonly store: S; readonly namespace: string; /** Default: global timers (unref'd where present) and `performance.now()`. */ readonly scheduler?: Scheduler; /** Bounds every store call. Default `'10s'`. */ readonly storeTimeout?: Duration; /** A release failed after a successful callback. `run` and `tryRun` still return the value. */ readonly onReleaseError?: (error: ReleaseFailure) => unknown; /** Default false: raw keys stay out of logs and spans. */ readonly logKeys?: boolean; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "Duration",
+      "kind": "type",
+      "signature": "export type Duration = number | `${number}${(typeof DURATION_UNITS)[number]}`;",
+      "jsdocSummary": "Milliseconds or a duration with an explicit supported unit."
+    },
+    {
+      "subpath": ".",
+      "name": "FenceOf",
+      "kind": "type",
+      "signature": "export type FenceOf<S extends Store> = FenceValue<S['guarantees']['fence']>;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "Grant",
+      "kind": "type",
+      "signature": "export type Grant = Readonly<{ key: Key; token: LockToken; fence?: LockFence; expiresAt?: number; conn?: unknown; lost?: Promise<LockError>; }>;",
+      "jsdocSummary": "Successful store ownership; conn is an explicitly foreign private handle."
+    },
+    {
+      "subpath": ".",
+      "name": "Guarantees",
+      "kind": "type",
+      "signature": "export type Guarantees = Readonly<{ [K in Exclude<keyof GuaranteeValues, 'runtime' | 'fence' | 'releasedBy'>]: GuaranteeValues[K][number]; } & { shared: boolean; permits: boolean; fence: GuaranteeValues['fence'][number] | false; poolerSafe: boolean; releasedBy?: GuaranteeValues['releasedBy'][number]; writerPreference?: boolean; runtimes: readonly GuaranteeValues['runtime'][number][]; }>;",
+      "jsdocSummary": "Capabilities determine which methods exist on the public handle."
+    },
+    {
+      "subpath": ".",
+      "name": "Guard",
+      "kind": "type",
+      "signature": "export type Guard<S extends Store> = GuardBase<S> & (S['guarantees']['releasedBy'] extends 'transaction' ? unknown : GuardRelease);",
+      "jsdocSummary": "An acquired lock."
+    },
+    {
+      "subpath": ".",
+      "name": "Key",
+      "kind": "type",
+      "signature": "export type Key = Readonly<{ namespace: string; name: string; full: import('./identities.js').LockKey; }>;",
+      "jsdocSummary": "A canonical resource key; createKey preserves its persisted encoding."
+    },
+    {
+      "subpath": ".",
+      "name": "LeaderOps",
+      "kind": "type",
+      "signature": "export type LeaderOps<S extends Store> = { /** Settles when `opts.signal` aborts. */ lead<T>(fn: (ctx: LockContext<S>) => T | Promise<T>, opts?: LeadOptions): Promise<void | FailureIn<Awaited<T>> | LockOperationFailure>; };",
+      "jsdocSummary": "Leader election. Only on lease stores."
+    },
+    {
+      "subpath": ".",
+      "name": "LeadOptions",
+      "kind": "type",
+      "signature": "export type LeadOptions = { readonly signal?: AbortSignal; };",
+      "jsdocSummary": "Abort = step down and stop campaigning."
+    },
+    {
+      "subpath": ".",
+      "name": "LOCK_COUNTER_NAMES",
+      "kind": "variable",
+      "signature": "export declare const LOCK_COUNTER_NAMES: readonly ['releaseErrors', 'leadAcquired', 'leadLost'];",
+      "jsdocSummary": "Names of the counters `Locks.counters` exposes (for tests)."
+    },
+    {
+      "subpath": ".",
+      "name": "LOCK_ERROR_CODES",
+      "kind": "variable",
+      "signature": "export declare const LOCK_ERROR_CODES: { /** * The caller's signal aborted the wait; the callback never ran. * * @fix Stop. The caller asked to cancel, so do not retry with the same signal. * @verify bun run test -- src/wait.test.ts */ readonly aborted: 'ARKI_LOCK_E002'; /** * Ownership was lost while the callback ran. The callback may have had side effects; nothing retries it. * * @fix Check what the callback finished before running it again. Pass the lock's `signal` to the work so it stops early, and use the fence for writes. * @verify bun run test -- src/locks.test.ts */ readonly lost: 'ARKI_LOCK_E003'; /** * Backend failure. Never treated as free or held. * * @fix Check the store (database, Redis or file system). When `outcome` is `unknown`, ownership may exist remotely, so wait for the lease to expire before you assume the key is free. * @verify bun run test -- src/locks.test.ts */ readonly store: 'ARKI_LOCK_E004'; /** * `guard.release()` failed or reported `unknown`. `run` and `tryRun` never throw this after a successful callback. * * @fix Check the store. On a lease store the key frees itself after `ttl`. Count these with `locks.counters.releaseErrors`. * @verify bun run test -- src/locks.test.ts */ readonly release: 'ARKI_LOCK_E005'; /** * Bad input or setup: empty key, bad duration, conflicting semaphore limit, session store on a pooled shape. * * @fix Fix the call named in the message: pass a non-empty key, a valid duration, one limit per semaphore key, and a single connection to a session store. * @verify bun run test -- src/key.test.ts */ readonly config: 'ARKI_LOCK_E006'; /** * A store lacks a capability the types could not see. Nothing throws this today. * * @fix Use a store that declares the capability in its `guarantees`. * @verify bun run test -- src/locks.test.ts */ readonly unsupported: 'ARKI_LOCK_E007'; };",
+      "jsdocSummary": "Stable ids, one per `LockError.code`. Never renumber. `ARKI_LOCK_E001` was `held`, now the {@link LockHeld} failure."
+    },
+    {
+      "subpath": ".",
+      "name": "LOCK_FAILURES",
+      "kind": "variable",
+      "signature": "export declare const LOCK_FAILURES: readonly [import(\"@arki/failure\").FailureDefinition<\"lock.held\", import(\"@standard-schema/spec\").StandardSchemaV1<{ key?: string | undefined; waitedMs: number; }, { key?: string | undefined; waitedMs: number; }>>, import(\"@arki/failure\").FailureDefinition<\"lock.aborted\", undefined>, import(\"@arki/failure\").FailureDefinition<\"lock.lost\", import(\"@standard-schema/spec\").StandardSchemaV1<{ detectedBy: \"connection\" | \"deadline\" | \"renewal\"; }, { detectedBy: \"connection\" | \"deadline\" | \"renewal\"; }>>, import(\"@arki/failure\").FailureDefinition<\"lock.store\", import(\"@standard-schema/spec\").StandardSchemaV1<{ method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }, { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>, import(\"@arki/failure\").FailureDefinition<\"contracts.random_source_unavailable\", undefined>, import(\"@arki/failure\").FailureDefinition<\"failure.unexpected_defect\", undefined>, import(\"@arki/failure\").FailureDefinition<\"lock.release\", import(\"@standard-schema/spec\").StandardSchemaV1<{ outcome: \"unknown\"; }, { outcome: \"unknown\"; }>>];",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "LOCK_RUN_FAILURES",
+      "kind": "variable",
+      "signature": "export declare const LOCK_RUN_FAILURES: readonly [import(\"@arki/failure\").FailureDefinition<\"lock.held\", import(\"@standard-schema/spec\").StandardSchemaV1<{ key?: string | undefined; waitedMs: number; }, { key?: string | undefined; waitedMs: number; }>>, import(\"@arki/failure\").FailureDefinition<\"lock.aborted\", undefined>, import(\"@arki/failure\").FailureDefinition<\"lock.lost\", import(\"@standard-schema/spec\").StandardSchemaV1<{ detectedBy: \"connection\" | \"deadline\" | \"renewal\"; }, { detectedBy: \"connection\" | \"deadline\" | \"renewal\"; }>>, import(\"@arki/failure\").FailureDefinition<\"lock.store\", import(\"@standard-schema/spec\").StandardSchemaV1<{ method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }, { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>, import(\"@arki/failure\").FailureDefinition<\"contracts.random_source_unavailable\", undefined>, import(\"@arki/failure\").FailureDefinition<\"failure.unexpected_defect\", undefined>];",
+      "jsdocSummary": "Every canonical operation outcome, with the original LockHeld definition retained."
+    },
+    {
+      "subpath": ".",
+      "name": "LockAborted",
+      "kind": "variable",
+      "signature": "export declare const LockAborted: import(\"@arki/failure\").FailureDefinition<\"lock.aborted\", undefined>;",
+      "jsdocSummary": "Cancellation ended acquisition before callback execution."
+    },
+    {
+      "subpath": ".",
+      "name": "LockContext",
+      "kind": "type",
+      "signature": "export type LockContext<S extends Store> = { /** Aborts when the lock is known lost (or the caller's signal aborts). */ readonly signal: AbortSignal; readonly fence: FenceOf<S>; readonly key: Key; };",
+      "jsdocSummary": "The only things a callback receives."
+    },
+    {
+      "subpath": ".",
+      "name": "LockCounters",
+      "kind": "type",
+      "signature": "export type LockCounters = Readonly<Record<(typeof LOCK_COUNTER_NAMES)[number], number>>;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "LockError",
+      "kind": "class",
+      "signature": "export declare class LockError extends Error { readonly code: LockErrorCode; /** The stable id of `code`, e.g. `ARKI_LOCK_E004`. */ readonly errorCode: (typeof LOCK_ERROR_CODES)[LockErrorCode]; readonly remediation: string; readonly outcome?: LockErrorInit['outcome']; readonly detectedBy?: LockErrorInit['detectedBy']; readonly method?: LockErrorInit['method']; readonly timeoutMs?: number; readonly suppressed?: readonly Error[]; constructor(init: LockErrorInit); }",
+      "jsdocSummary": "A thrown, coded error of `@arki/lock`: a bug, misuse, or a store fault."
+    },
+    {
+      "subpath": ".",
+      "name": "LockErrorCode",
+      "kind": "type",
+      "signature": "export type LockErrorCode = keyof typeof LOCK_ERROR_CODES;",
+      "jsdocSummary": "Which failure a {@link LockError} is."
+    },
+    {
+      "subpath": ".",
+      "name": "LockErrorInit",
+      "kind": "type",
+      "signature": "export type LockErrorInit = { readonly code: LockErrorCode; readonly message: string; /** What to do about it, in one sentence. */ readonly remediation: string; readonly cause?: unknown; /** On `store`: whether ownership might exist remotely. */ readonly outcome?: ReturnType<typeof LockStoreFailure>['data']['outcome']; /** On `lost`: the store refused a renewal, the local deadline passed, or the pinned connection closed. */ readonly detectedBy?: ReturnType<typeof LockLost>['data']['detectedBy']; /** On `store` and `release`: which store call failed. */ readonly method?: Exclude<ReturnType<typeof LockStoreFailure>['data']['method'], 'ddl' | 'dispose'>; /** On `store`: set when `storeTimeout` fired. */ readonly timeoutMs?: number; /** Lock-side errors that rode along with a callback error (the `using` convention). */ readonly suppressed?: readonly Error[]; };",
+      "jsdocSummary": "What a {@link LockError} is built from."
+    },
+    {
+      "subpath": ".",
+      "name": "LockFence",
+      "kind": "type",
+      "signature": "export type LockFence = bigint & { readonly [lockFenceBrand]: true; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "LockHeld",
+      "kind": "variable",
+      "signature": "export declare const LockHeld: import(\"@arki/failure\").FailureDefinition<\"lock.held\", import(\"@standard-schema/spec\").StandardSchemaV1<{ key?: string | undefined; waitedMs: number; }, { key?: string | undefined; waitedMs: number; }>>; ; export type LockHeld = ReturnType<typeof LockHeld>;",
+      "jsdocSummary": "The lock was busy: the one attempt was refused, or the wait ended with the lock still held. `key` is the full key, present only when the manager was made with `logKeys: true` (raw keys stay out of logs by default). `waitedMs` is 0 for `tryRun` and `tryAcquire`. A {@link LockHeld} failure value."
+    },
+    {
+      "subpath": ".",
+      "name": "LockKey",
+      "kind": "type",
+      "signature": "export type LockKey = string & { readonly [lockKeyBrand]: true; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "LockLost",
+      "kind": "variable",
+      "signature": "export declare const LockLost: import(\"@arki/failure\").FailureDefinition<\"lock.lost\", import(\"@standard-schema/spec\").StandardSchemaV1<{ detectedBy: \"connection\" | \"deadline\" | \"renewal\"; }, { detectedBy: \"connection\" | \"deadline\" | \"renewal\"; }>>;",
+      "jsdocSummary": "Ownership ended after work may have started. This never authorizes replay."
+    },
+    {
+      "subpath": ".",
+      "name": "LockMethod",
+      "kind": "type",
+      "signature": "export type LockMethod = NonNullable<LockErrorInit['method']>;",
+      "jsdocSummary": "Which store call a {@link LockError} blames."
+    },
+    {
+      "subpath": ".",
+      "name": "LockOperationFailure",
+      "kind": "type",
+      "signature": "export type LockOperationFailure = ReturnType<typeof lockFailure>;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "LockReleaseFailed",
+      "kind": "variable",
+      "signature": "export declare const LockReleaseFailed: import(\"@arki/failure\").FailureDefinition<\"lock.release\", import(\"@standard-schema/spec\").StandardSchemaV1<{ outcome: \"unknown\"; }, { outcome: \"unknown\"; }>>;",
+      "jsdocSummary": "Release was not confirmed. Successful callback work must never be replayed on this evidence."
+    },
+    {
+      "subpath": ".",
+      "name": "LockRunFailure",
+      "kind": "type",
+      "signature": "export type LockRunFailure = FailureOf<(typeof LOCK_RUN_FAILURES)[number]>;",
+      "jsdocSummary": "Exact run outcomes from their canonical definition source."
+    },
+    {
+      "subpath": ".",
+      "name": "Locks",
+      "kind": "type",
+      "signature": "export type Locks<S extends Store> = { readonly store: S; /** The namespace every key of this manager lives in. */ readonly namespace: string; readonly counters: LockCounters; mutex(key: string): MutexHandle<S>; } & (S['guarantees']['permits'] extends true ? { semaphore(key: string, config: SemaphoreConfig): SemaphoreHandle<S>; } : unknown) & (S['guarantees']['shared'] extends true ? { readWrite(key: string): ReadWriteHandle<S>; } : unknown);",
+      "jsdocSummary": "What `createLocks` returns. `semaphore` and `readWrite` exist only when the store supports them."
+    },
+    {
+      "subpath": ".",
+      "name": "LocksFor",
+      "kind": "type",
+      "signature": "export type LocksFor<G extends Guarantees> = Locks<Store<G>>;",
+      "jsdocSummary": "The lock handle typed by what the store promises, not by the store itself: any store with the same `guarantees` fits. `Locks<S>` of a concrete store is assignable to it, so it is the type to publish as a service, and a test can provide one on another store (`testStore`)."
+    },
+    {
+      "subpath": ".",
+      "name": "LockStoreFailure",
+      "kind": "variable",
+      "signature": "export declare const LockStoreFailure: import(\"@arki/failure\").FailureDefinition<\"lock.store\", import(\"@standard-schema/spec\").StandardSchemaV1<{ method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }, { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>;",
+      "jsdocSummary": "A backend operation failed with explicit ownership uncertainty."
+    },
+    {
+      "subpath": ".",
+      "name": "LockToken",
+      "kind": "type",
+      "signature": "export type LockToken = IdOf<typeof lockToken>;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "LockVerbs",
+      "kind": "type",
+      "signature": "export type LockVerbs<S extends Store, Extra = unknown> = { /** One atomic attempt. The value of `fn`, or {@link LockHeld} when the lock is busy: contention is a value, never an error. */ tryRun<T>(fn: (ctx: LockContext<S>) => T | Promise<T>, opts?: TryOptions<Extra>): Promise<Awaited<T> | LockRunFailure>; /** Waits up to `wait`, or until `signal` aborts. {@link LockHeld} when the lock is still busy after the wait; throws `aborted`. */ run<T>(fn: (ctx: LockContext<S>) => T | Promise<T>, ...opts: RunArgs<S, Extra>): Promise<Awaited<T> | LockRunFailure>; /** Waits like `run`. You release the guard yourself. */ acquire(...opts: RunArgs<S, Extra>): Promise<Guard<S> | LockRunFailure>; /** One attempt, like `tryRun`. You release the guard yourself. */ tryAcquire(opts?: TryOptions<Extra>): Promise<Guard<S> | LockRunFailure>; };",
+      "jsdocSummary": "The four verbs every lock handle has. `Extra` carries the options of one handle kind."
+    },
+    {
+      "subpath": ".",
+      "name": "MutexHandle",
+      "kind": "type",
+      "signature": "export type MutexHandle<S extends Store> = LockVerbs<S> & (IsLease<S> extends true ? LeaderOps<S> : unknown);",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "PermitOps",
+      "kind": "type",
+      "signature": "export type PermitOps<F = StoreFailure> = { acquire(key: Key, req: PermitRequest): Promise<Grant | undefined | F>; release(grant: Grant): Promise<ReleaseOutcome | F>; extend?(grant: Grant, ttlMs: number): Promise<boolean | F>; /** * Optional. The manager calls it once per waiting caller, after the caller's first refused * attempt, and prefers it to `Store.waitFor`. The waiter's condition is \"`weight` permits do * not fit now\", which lets a store wake only the waiters that can fit and never miss a permit * freed between a refusal and the wait. `close()` is called after the caller's last attempt. */ waiter?(key: Key, weight: number): Waiter<F>; };",
+      "jsdocSummary": "Semaphore protocol of a store with `guarantees.permits`."
+    },
+    {
+      "subpath": ".",
+      "name": "PermitRequest",
+      "kind": "type",
+      "signature": "export type PermitRequest = AcquireRequest & { readonly limit: number; readonly weight: number; };",
+      "jsdocSummary": "One attempt at `weight` of `limit` permits. The store persists `limit` and rejects a conflicting one with `config`."
+    },
+    {
+      "subpath": ".",
+      "name": "ReadWriteHandle",
+      "kind": "type",
+      "signature": "export type ReadWriteHandle<S extends Store> = { readonly read: LockVerbs<S>; readonly write: LockVerbs<S>; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "ReleaseFailure",
+      "kind": "type",
+      "signature": "export type ReleaseFailure = ReturnType<typeof releaseFailure>;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "ReleaseOutcome",
+      "kind": "type",
+      "signature": "export type ReleaseOutcome = (typeof RELEASE_OUTCOMES)[number];",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "RunArgs",
+      "kind": "type",
+      "signature": "export type RunArgs<S extends Store, Extra = unknown> = Record<never, never> extends RunOptions<S, Extra> ? [opts?: RunOptions<S, Extra>] : [opts: RunOptions<S, Extra>];",
+      "jsdocSummary": "`run(fn)` needs no options on a process-scope store; elsewhere they are required."
+    },
+    {
+      "subpath": ".",
+      "name": "RunOptions",
+      "kind": "type",
+      "signature": "export type RunOptions<S extends Store, Extra = unknown> = CallOptions & Extra & WaitBound<S>;",
+      "jsdocSummary": "Options of the verbs that wait (`run`, `acquire`)."
+    },
+    {
+      "subpath": ".",
+      "name": "Scheduler",
+      "kind": "type",
+      "signature": "export type Scheduler = { /** Milliseconds on a monotonic clock. Only differences mean anything. */ now(): number; /** Run `cb` after `ms`. `ref: true` keeps the process alive where the runtime supports it; default `false`. */ setTimeout(cb: () => unknown, ms: number, opts?: { readonly ref?: boolean; }): SchedulerHandle; clearTimeout(handle: SchedulerHandle): void; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "SchedulerHandle",
+      "kind": "type",
+      "signature": "export type SchedulerHandle = { readonly id: number; };",
+      "jsdocSummary": "Opaque token for a pending timer."
+    },
+    {
+      "subpath": ".",
+      "name": "SemaphoreConfig",
+      "kind": "type",
+      "signature": "export type SemaphoreConfig = { limit: number; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "SemaphoreHandle",
+      "kind": "type",
+      "signature": "export type SemaphoreHandle<S extends Store> = LockVerbs<S, WeightOption>;",
+      "jsdocSummary": "Only a semaphore takes `weight`."
+    },
+    {
+      "subpath": ".",
+      "name": "SharedOps",
+      "kind": "type",
+      "signature": "export type SharedOps<F = StoreFailure> = { acquire(key: Key, req: SharedRequest): Promise<Grant | undefined | F>; release(grant: Grant): Promise<ReleaseOutcome | F>; extend?(grant: Grant, ttlMs: number): Promise<boolean | F>; /** * Optional, for writer preference. The manager calls it once per waiting caller, after the * caller's first refused attempt, and prefers it to `Store.waitFor`. A store that counts the * writers it returns here can refuse new readers while one waits. The waiter stays registered * until `close()`, which the manager calls only after the caller's last attempt has settled: * that closes the gap between a wake-up and the woken writer's next attempt. Remote stores in * v1 do not implement it. */ waiter?(key: Key, mode: SharedRequest['mode']): Waiter<F>; };",
+      "jsdocSummary": "Read/write protocol of a store with `guarantees.shared`."
+    },
+    {
+      "subpath": ".",
+      "name": "SharedRequest",
+      "kind": "type",
+      "signature": "export type SharedRequest = AcquireRequest & { readonly mode: (typeof SHARED_MODES)[number]; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "Store",
+      "kind": "type",
+      "signature": "export type Store<G extends Guarantees = Guarantees, F = StoreFailure> = StoreBase<G, F> & LeaseTtl<G>;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "StoreFailure",
+      "kind": "type",
+      "signature": "export type StoreFailure = ReturnType<typeof storeFailure>;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": ".",
+      "name": "TryOptions",
+      "kind": "type",
+      "signature": "export type TryOptions<Extra = unknown> = CallOptions & Extra & { readonly signal?: AbortSignal; };",
+      "jsdocSummary": "Options of the verbs that never wait. `Extra` carries options of one handle kind, such as {@link WeightOption}."
+    },
+    {
+      "subpath": ".",
+      "name": "Waiter",
+      "kind": "type",
+      "signature": "export type Waiter<F = StoreFailure> = { /** * Resolves when the key may have changed in a way this caller cares about, or when `signal` * aborts. It must also resolve at once when the caller could already fit, so a release that * happened between the refusal and this call is not missed. */ waitFor(signal: AbortSignal): Promise<void | F>; /** The caller stopped waiting. Idempotent. */ close(): void; };",
+      "jsdocSummary": "One caller's wait on a key, from its first refused attempt until its acquire loop ends (acquired, timed out or aborted). See {@link PermitOps.waiter} and {@link SharedOps.waiter}."
+    },
+    {
+      "subpath": ".",
+      "name": "WeightOption",
+      "kind": "type",
+      "signature": "export type WeightOption = { /** Permits to take. A positive integer up to the limit. */ readonly weight?: number; };",
+      "jsdocSummary": "Options only a semaphore handle takes."
+    },
+    {
+      "subpath": "./dot",
+      "name": "describeLocks",
+      "kind": "function",
+      "signature": "export declare function describeLocks(service: { readonly store: Store; }): LocksDescription;",
+      "jsdocSummary": "Name the store behind a lock service and what it promises."
+    },
+    {
+      "subpath": "./dot",
+      "name": "locks",
+      "kind": "function",
+      "signature": "export declare function locks<G extends Guarantees, TShape extends NeedsShape & NoReservedKeys = EmptyShape>(options: LocksPluginOptions<TShape, Store<G>>): Omit<import(\"@arki/dot/unit\").Unit<import(\"@arki/dot/unit\").WireNeeds<TShape>, import(\"@arki/dot/unit\").ProvidedValues<{ locks: { readonly store: Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>; readonly namespace: string; readonly counters: import(\"../types.js\").LockCounters; mutex(key: string): import(\"../types.js\").MutexHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } & (Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>[\"guarantees\"][\"permits\"] extends true ? { semaphore(key: string, config: import(\"../types.js\").SemaphoreConfig): import(\"../types.js\").SemaphoreHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } : unknown) & (Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>[\"guarantees\"][\"shared\"] extends true ? { readWrite(key: string): import(\"../types.js\").ReadWriteHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } : unknown); }>, TShape, \"locks\", import(\"@arki/dot/unit\").EmptyOwnership, import(\"@arki/dot/unit\").EmptyPhases>, \"factories\" | \"hooks\" | \"logging\"> & import(\"@arki/dot/unit\").LoggingSlot<import(\"@arki/dot/unit\").DotLoggingHandle<undefined>> & import(\"@arki/dot/unit\").FactoryContract<import(\"@arki/dot/unit\").ProvidedValues<{ locks: { readonly store: Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>; readonly namespace: string; readonly counters: import(\"../types.js\").LockCounters; mutex(key: string): import(\"../types.js\").MutexHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } & (Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>[\"guarantees\"][\"permits\"] extends true ? { semaphore(key: string, config: import(\"../types.js\").SemaphoreConfig): import(\"../types.js\").SemaphoreHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } : unknown) & (Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>[\"guarantees\"][\"shared\"] extends true ? { readWrite(key: string): import(\"../types.js\").ReadWriteHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } : unknown); }>> & { readonly factories: { readonly locks: (ctx: never) => { readonly store: Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>; readonly namespace: string; readonly counters: import(\"../types.js\").LockCounters; mutex(key: string): import(\"../types.js\").MutexHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } & (Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>[\"guarantees\"][\"permits\"] extends true ? { semaphore(key: string, config: import(\"../types.js\").SemaphoreConfig): import(\"../types.js\").SemaphoreHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } : unknown) & (Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>[\"guarantees\"][\"shared\"] extends true ? { readWrite(key: string): import(\"../types.js\").ReadWriteHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } : unknown); }; readonly hooks: import(\"@arki/dot/unit\").PhaseHooks<never, { readonly configure: undefined; readonly start: undefined; readonly stop: undefined; readonly dispose: undefined; }, import(\"@arki/dot/unit\").DotConfigureContext> & import(\"@arki/dot/unit\").BootSlot<CtxOf<TShape> & import(\"@arki/dot/unit\").ProvidedValues<{ locks: { readonly store: Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>; readonly namespace: string; readonly counters: import(\"../types.js\").LockCounters; mutex(key: string): import(\"../types.js\").MutexHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } & (Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>[\"guarantees\"][\"permits\"] extends true ? { semaphore(key: string, config: import(\"../types.js\").SemaphoreConfig): import(\"../types.js\").SemaphoreHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } : unknown) & (Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>[\"guarantees\"][\"shared\"] extends true ? { readWrite(key: string): import(\"../types.js\").ReadWriteHandle<Store<G, import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }>>>; } : unknown); }> & import(\"@arki/dot/unit\").KernelCtx, undefined>; } & import(\"@arki/dot/unit\").InfraRole;",
+      "jsdocSummary": "Publish `locks`. The store is built, checked and wrapped at boot; a bad store fails the boot."
+    },
+    {
+      "subpath": "./dot",
+      "name": "LocksDescription",
+      "kind": "type",
+      "signature": "export type LocksDescription = { readonly store: string; readonly kind: Store['guarantees']['kind']; readonly scope: Store['guarantees']['scope']; readonly fence: Store['guarantees']['fence']; readonly releasedOnCrash: Store['guarantees']['releasedOnCrash']; };",
+      "jsdocSummary": "What a lock service is backed by, for `dot explain` text."
+    },
+    {
+      "subpath": "./dot",
+      "name": "LocksPluginOptions",
+      "kind": "type",
+      "signature": "export type LocksPluginOptions<TShape extends NeedsShape, S extends Store> = { /** Prefix for every key, so two apps on one backend never collide. */ readonly namespace: string; /** Services the store factory reads, e.g. `{ db: database.provides.db }`. */ readonly needs?: TShape; readonly store: (deps: CtxOf<TShape>) => S; /** Allow a process-scope store in production. Only right for a single-replica app. */ readonly allowProcessScope?: boolean; readonly storeTimeout?: CreateLocksOptions<S>['storeTimeout']; readonly onReleaseError?: CreateLocksOptions<S>['onReleaseError']; };",
+      "jsdocSummary": "What `locks(...)` takes. `store` builds the store from the services named in `needs`."
+    },
+    {
+      "subpath": "./file",
+      "name": "fileGuarantees",
+      "kind": "variable",
+      "signature": "export declare const fileGuarantees: { readonly kind: 'lease'; readonly scope: 'host'; readonly wait: 'poll'; readonly shared: false; readonly permits: false; readonly fence: false; readonly releasedOnCrash: 'after-ttl'; readonly clock: 'host'; readonly poolerSafe: true; readonly runtimes: readonly [\"node\", \"bun\", \"deno\"]; };",
+      "jsdocSummary": "What `fileStore` promises."
+    },
+    {
+      "subpath": "./file",
+      "name": "FileGuarantees",
+      "kind": "type",
+      "signature": "export type FileGuarantees = typeof fileGuarantees;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./file",
+      "name": "fileStore",
+      "kind": "function",
+      "signature": "export declare function fileStore(dir: string, options?: FileStoreOptions): FileStore;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./file",
+      "name": "FileStore",
+      "kind": "type",
+      "signature": "export type FileStore = Store<FileGuarantees> & { /** The lock directory of `key`. For tests and debugging. */ lockPath(key: Key): string; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./file",
+      "name": "FileStoreOptions",
+      "kind": "type",
+      "signature": "export type FileStoreOptions = { /** A lock whose mtime is older than this is dead and may be taken over. It is the lease length. Default 10 s. */ readonly stale?: number; /** How often a blocked `waitFor` looks again when `fs.watch` says nothing. Default 250 ms. */ readonly pollMs?: number; /** Wall-clock milliseconds, compared with file mtimes. Default `Date.now`. Tests move it. */ readonly now?: () => number; /** Timers for `waitFor`. Default: the global timers. */ readonly scheduler?: Scheduler; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./memory",
+      "name": "MemoryEntry",
+      "kind": "type",
+      "signature": "export type MemoryEntry = { /** Mutex: the holder. Semaphore and readers: the earliest holder. */ readonly owner: LockToken; /** The newest fence handed out for this key. */ readonly fence: LockFence; readonly expiresAt?: number; /** Read/write keys: what the holders hold. */ readonly mode?: 'read' | 'write'; /** Semaphore keys: permits in use. */ readonly permits?: number; /** Semaphore and read keys: how many holds there are. */ readonly holders?: number; };",
+      "jsdocSummary": "What `peek` shows about a held key. A copy: changing it changes nothing."
+    },
+    {
+      "subpath": "./memory",
+      "name": "memoryGuarantees",
+      "kind": "variable",
+      "signature": "export declare const memoryGuarantees: { readonly kind: 'hold'; readonly scope: 'process'; readonly wait: 'wake'; readonly shared: true; readonly writerPreference: true; readonly permits: true; readonly fence: 'process'; readonly releasedOnCrash: 'immediate'; readonly clock: 'none'; readonly poolerSafe: true; readonly runtimes: readonly [\"node\", \"bun\", \"deno\", \"browser\", \"hermes\"]; };",
+      "jsdocSummary": "What `memoryStore` promises."
+    },
+    {
+      "subpath": "./memory",
+      "name": "MemoryGuarantees",
+      "kind": "type",
+      "signature": "export type MemoryGuarantees = typeof memoryGuarantees;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./memory",
+      "name": "memoryStore",
+      "kind": "function",
+      "signature": "export declare function memoryStore(): MemoryStore;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./memory",
+      "name": "MemoryStore",
+      "kind": "type",
+      "signature": "export type MemoryStore = Store<MemoryGuarantees, never> & { /** Resolves when the key is free (any primitive), or when `signal` aborts. */ waitFor(key: Key, signal: AbortSignal): Promise<void>; /** A mutex waiter: queued now, handed the lock by a release. */ waiter(key: Key): Waiter<never>; readonly permits: PermitOps<never> & { waiter(key: Key, weight: number): Waiter<never>; }; readonly shared: SharedOps<never> & { waiter(key: Key, mode: 'read' | 'write'): Waiter<never>; }; /** The current holder of `key`, if any. A lock reserved for a woken waiter has none yet. For tests and debugging. */ peek(key: Key): MemoryEntry | undefined; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./pg",
+      "name": "HOLD_BEAT_SECONDS",
+      "kind": "variable",
+      "signature": "export declare const HOLD_BEAT_SECONDS = 0.2;",
+      "jsdocSummary": "Longest beat of the pinned connection while a lock is held."
+    },
+    {
+      "subpath": "./pg",
+      "name": "HOLD_BEAT_TIMEOUT_MS",
+      "kind": "variable",
+      "signature": "export declare const HOLD_BEAT_TIMEOUT_MS = 5000;",
+      "jsdocSummary": "A beat still unanswered after this long means a silent connection; the hold is reported lost."
+    },
+    {
+      "subpath": "./pg",
+      "name": "HOLD_FIRST_BEAT_SECONDS",
+      "kind": "variable",
+      "signature": "export declare const HOLD_FIRST_BEAT_SECONDS = 0.001;",
+      "jsdocSummary": "The first beat of a hold; each next one doubles until `HOLD_BEAT_SECONDS`."
+    },
+    {
+      "subpath": "./pg",
+      "name": "LockableDb",
+      "kind": "type",
+      "signature": "export type LockableDb = { transaction<T>(run: (tx: PgExecutor) => Promise<T>): Promise<T>; };",
+      "jsdocSummary": "The least a database must offer: a transaction whose handle runs raw SQL."
+    },
+    {
+      "subpath": "./pg",
+      "name": "PgExecutor",
+      "kind": "type",
+      "signature": "export type PgExecutor = { execute(query: SQL): PromiseLike<unknown>; };",
+      "jsdocSummary": "The least a transaction handle must offer: run raw SQL (node-postgres, PGlite, postgres.js through Drizzle)."
+    },
+    {
+      "subpath": "./pg",
+      "name": "PgLockOptions",
+      "kind": "type",
+      "signature": "export type PgLockOptions = { /** * Lock `hashtext('<namespace>:<name>')` (one bigint key) like `@arki/db`'s old * `withAdvisoryLock` did. Replicas on the legacy and the default key space do * not exclude each other, so a rolling deploy must switch every replica together. */ readonly legacyKeys?: boolean; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./pg",
+      "name": "pgSession",
+      "kind": "function",
+      "signature": "export declare function pgSession(db: LockableDb, options?: PgSessionOptions): Store<PgSessionGuarantees> & { readonly shared: SharedOps; };",
+      "jsdocSummary": "Advisory locks that own their connection: each acquire opens a transaction on `db`, takes the lock, and keeps the transaction open until release. One pool slot is used per held lock, so the pool needs a second connection for the job itself."
+    },
+    {
+      "subpath": "./pg",
+      "name": "pgSessionGuarantees",
+      "kind": "variable",
+      "signature": "export declare const pgSessionGuarantees: { readonly kind: 'hold'; readonly scope: 'cluster'; readonly wait: 'native'; readonly shared: true; readonly permits: false; readonly fence: false; readonly releasedOnCrash: 'immediate'; readonly clock: 'none'; readonly poolerSafe: true; readonly runtimes: readonly [\"node\", \"bun\", \"deno\"]; };",
+      "jsdocSummary": "What `pgSession` promises."
+    },
+    {
+      "subpath": "./pg",
+      "name": "PgSessionGuarantees",
+      "kind": "type",
+      "signature": "export type PgSessionGuarantees = typeof pgSessionGuarantees;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./pg",
+      "name": "PgSessionOptions",
+      "kind": "type",
+      "signature": "export type PgSessionOptions = PgLockOptions & { /** * Beat on the pinned connection while held, so a dead or silent connection * resolves `Grant.lost`. Default `true`. Turn it off for in-process databases * such as PGlite, where there is no connection to lose and each beat would * block the thread; grants then carry no `lost`. */ readonly keepAlive?: boolean; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./pg",
+      "name": "pgTransaction",
+      "kind": "function",
+      "signature": "export declare function pgTransaction(tx: PgExecutor, options?: PgLockOptions): Store<PgTransactionGuarantees> & { readonly shared: SharedOps; };",
+      "jsdocSummary": "Advisory locks inside a transaction you already have. The lock lives until that transaction ends; `release` only forgets the grant. Given a savepoint handle (a nested `tx.transaction`), a ROLLBACK of that savepoint frees the lock at once, while the outer transaction goes on. Postgres advisory locks are re-entrant within one session, so a second acquire of the same key on the same transaction succeeds: exclusion is between transactions. That holds for read/write too: a read followed by a write of the same key in ONE transaction is granted (Postgres lets one session take both), so there is no upgrade check here."
+    },
+    {
+      "subpath": "./pg",
+      "name": "pgTransactionGuarantees",
+      "kind": "variable",
+      "signature": "export declare const pgTransactionGuarantees: { readonly kind: 'hold'; readonly scope: 'cluster'; readonly wait: 'native'; readonly shared: true; readonly permits: false; readonly fence: false; readonly releasedOnCrash: 'immediate'; readonly clock: 'none'; readonly poolerSafe: true; readonly runtimes: readonly [\"node\", \"bun\", \"deno\"]; readonly releasedBy: 'transaction'; };",
+      "jsdocSummary": "What `pgTransaction` promises: `pgSession`'s guarantees, and the lock ends with the caller's transaction."
+    },
+    {
+      "subpath": "./pg",
+      "name": "PgTransactionGuarantees",
+      "kind": "type",
+      "signature": "export type PgTransactionGuarantees = typeof pgTransactionGuarantees;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./pg",
+      "name": "WAIT_SLICE_MS",
+      "kind": "variable",
+      "signature": "export declare const WAIT_SLICE_MS = 1000;",
+      "jsdocSummary": "Longest single `lock_timeout` slice of a wait; a caller's signal is honoured between slices."
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "DEFAULT_LEASE_TABLE",
+      "kind": "variable",
+      "signature": "export declare const DEFAULT_LEASE_TABLE = \"arki_lock\";",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "ensureLockTable",
+      "kind": "function",
+      "signature": "export declare function ensureLockTable(db: LeaseDb, table?: string): Promise<import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }> | undefined>;",
+      "jsdocSummary": "Create the lease table if it is not there. Safe to call at every boot, from every replica at once."
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "LEASE_TABLE_SQL",
+      "kind": "variable",
+      "signature": "export declare const LEASE_TABLE_SQL: string;",
+      "jsdocSummary": "The DDL for the default table name."
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "LeaseDb",
+      "kind": "type",
+      "signature": "export type LeaseDb = { execute(query: SQL): PromiseLike<unknown>; };",
+      "jsdocSummary": "The least a database must offer: raw SQL (drizzle on node-postgres, postgres.js or PGlite). Autocommit only, never a transaction handle: a rollback would undo an acquire (and hand the same fence out again) or undo a release (and keep the key held to ttl). The first acquire checks this and refuses a transaction with `LockError{code:'config'}`."
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "leaseTableSql",
+      "kind": "function",
+      "signature": "export declare function leaseTableSql(table: string): string;",
+      "jsdocSummary": "The DDL for `table`, as text. Idempotent."
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "leaseUpgradeSql",
+      "kind": "function",
+      "signature": "export declare function leaseUpgradeSql(table: string): string;",
+      "jsdocSummary": "PL/pgSQL statements (for a DO block) that add the `holders` column to a table made before semaphores. The catalog is checked first: ALTER TABLE takes ACCESS EXCLUSIVE even when the column exists, which would stall every lease behind any open reader at each boot."
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "ListenClient",
+      "kind": "type",
+      "signature": "export type ListenClient = { query(text: string): Promise<unknown>; on(event: string, listener: (...args: never[]) => void): unknown; /** `true` destroys the connection. */ release(error?: Error | boolean): void; };",
+      "jsdocSummary": "A dedicated connection for LISTEN, such as `pool.connect()` on node-postgres. Never a pooled-per-statement connection: LISTEN lives on one session."
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "pgLease",
+      "kind": "function",
+      "signature": "export declare function pgLease(db: LeaseDb, options: PgLeaseOptions): PgLeaseStore<PgLeasePollGuarantees>; ; export declare function pgLease(db: LeaseDb, options: PgLeaseListenOptions): PgLeaseStore<PgLeaseWakeGuarantees>;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "PgLeaseListenOptions",
+      "kind": "type",
+      "signature": "export type PgLeaseListenOptions = PgLeaseOptions & { /** * Gives a dedicated connection. With it, waiters wake on release instead of polling. * A direct connection: through PgBouncer in transaction mode LISTEN hears nothing. */ readonly listen: () => Promise<ListenClient>; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "PgLeaseOptions",
+      "kind": "type",
+      "signature": "export type PgLeaseOptions = { /** How long the lease lasts without renewal. At least 1 s. */ readonly ttl: Duration; /** Default `arki_lock`. `name` or `schema.name`. */ readonly table?: string; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "pgLeasePollGuarantees",
+      "kind": "variable",
+      "signature": "export declare const pgLeasePollGuarantees: { readonly kind: 'lease'; readonly scope: 'cluster'; readonly shared: false; readonly permits: true; readonly fence: 'durable'; readonly releasedOnCrash: 'after-ttl'; readonly clock: 'store'; readonly poolerSafe: true; readonly runtimes: readonly ['node', 'bun', 'deno']; readonly wait: 'poll'; };",
+      "jsdocSummary": "What `pgLease(db, { ttl })` promises: waiters poll."
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "PgLeasePollGuarantees",
+      "kind": "type",
+      "signature": "export type PgLeasePollGuarantees = typeof pgLeasePollGuarantees;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "PgLeaseStore",
+      "kind": "type",
+      "signature": "export type PgLeaseStore<G extends PgLeasePollGuarantees | PgLeaseWakeGuarantees> = Store<G> & { readonly permits: PermitOps; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "pgLeaseWakeGuarantees",
+      "kind": "variable",
+      "signature": "export declare const pgLeaseWakeGuarantees: { readonly kind: 'lease'; readonly scope: 'cluster'; readonly shared: false; readonly permits: true; readonly fence: 'durable'; readonly releasedOnCrash: 'after-ttl'; readonly clock: 'store'; readonly poolerSafe: true; readonly runtimes: readonly ['node', 'bun', 'deno']; readonly wait: 'wake'; };",
+      "jsdocSummary": "What `pgLease(db, { ttl, listen })` promises: waiters wake on release."
+    },
+    {
+      "subpath": "./pg/lease",
+      "name": "PgLeaseWakeGuarantees",
+      "kind": "type",
+      "signature": "export type PgLeaseWakeGuarantees = typeof pgLeaseWakeGuarantees;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./redis",
+      "name": "redisGuarantees",
+      "kind": "variable",
+      "signature": "export declare const redisGuarantees: { readonly kind: 'lease'; readonly scope: 'cluster'; readonly wait: \"wake\"; readonly shared: true; readonly permits: true; readonly fence: 'best-effort'; readonly releasedOnCrash: 'after-ttl'; readonly clock: 'store'; readonly poolerSafe: true; readonly runtimes: readonly [\"node\", \"bun\", \"deno\"]; };",
+      "jsdocSummary": "What `redisStore` promises, with `wait: 'wake'` (the default `wake: 'pubsub'`). The store's own `guarantees.wait` reads `'poll'` once pub/sub has failed or was switched off. The type keeps both."
+    },
+    {
+      "subpath": "./redis",
+      "name": "RedisGuarantees",
+      "kind": "type",
+      "signature": "export type RedisGuarantees = Omit<typeof redisGuarantees, 'wait'> & { readonly wait: (typeof REDIS_WAIT_MODES)[number]; };",
+      "jsdocSummary": "Runtime wait support changes only between the canonical Redis modes."
+    },
+    {
+      "subpath": "./redis",
+      "name": "redisKeys",
+      "kind": "function",
+      "signature": "export declare function redisKeys(key: Key): { readonly lock: string; readonly fence: string; readonly channel: string; readonly meta: string; readonly readers: string; readonly writer: string; readonly readerFences: string; };",
+      "jsdocSummary": "The Redis keys of one lock. They share the hash tag, so they share a cluster slot. `lock` is the mutex key, the semaphore's holder ZSET, or unused by a read/write lock (which uses `readers` and `writer`). `meta` is the semaphore's limit and weights."
+    },
+    {
+      "subpath": "./redis",
+      "name": "redisStore",
+      "kind": "function",
+      "signature": "export declare function redisStore(client: Redis, options: RedisStoreOptions): RedisStore;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./redis",
+      "name": "RedisStore",
+      "kind": "type",
+      "signature": "export type RedisStore = Store<RedisGuarantees> & { readonly permits: PermitOps; readonly shared: SharedOps; /** Resolves when the key looks free, or when `signal` aborts. */ waitFor(key: Key, signal: AbortSignal): Promise<void | import('../errors.js').StoreFailure>; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./redis",
+      "name": "RedisStoreOptions",
+      "kind": "type",
+      "signature": "export type RedisStoreOptions = { /** Lease length. The manager renews at a third of it. */ readonly ttl: Duration; /** * `'pubsub'` (default): waiters wake on release through a second connection. * `'poll'`: no second connection; waiters poll with backoff. */ readonly wake?: 'pubsub' | 'poll'; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./sqlite",
+      "name": "DEFAULT_LEASE_TABLE",
+      "kind": "variable",
+      "signature": "export declare const DEFAULT_LEASE_TABLE = \"arki_lock\";",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./sqlite",
+      "name": "ensureLockTable",
+      "kind": "function",
+      "signature": "export declare function ensureLockTable(db: SqliteLeaseDb, table?: string): Promise<import(\"@arki/failure\").Failure<\"failure.unexpected_defect\", undefined> | import(\"@arki/failure\").Failure<\"lock.store\", { method: \"acquire\" | \"ddl\" | \"dispose\" | \"extend\" | \"permits\" | \"release\" | \"shared\" | \"waitFor\"; outcome: \"not-acquired\" | \"unknown\"; timeoutMs?: number | undefined; }> | undefined>;",
+      "jsdocSummary": "Create the lease table if it is not there. Safe to call at every boot."
+    },
+    {
+      "subpath": "./sqlite",
+      "name": "LEASE_TABLE_SQL",
+      "kind": "variable",
+      "signature": "export declare const LEASE_TABLE_SQL: string;",
+      "jsdocSummary": "The DDL for the default table name, to copy into a migration."
+    },
+    {
+      "subpath": "./sqlite",
+      "name": "leaseTableSql",
+      "kind": "function",
+      "signature": "export declare function leaseTableSql(table: string): string;",
+      "jsdocSummary": "The DDL for `table`, as text. Idempotent. Times are ms since the epoch; `holders` is a JSON array."
+    },
+    {
+      "subpath": "./sqlite",
+      "name": "sqliteLease",
+      "kind": "function",
+      "signature": "export declare function sqliteLease(db: SqliteLeaseDb, options: SqliteLeaseOptions): SqliteLeaseStore;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./sqlite",
+      "name": "SqliteLeaseDb",
+      "kind": "type",
+      "signature": "export type SqliteLeaseDb = { run(query: SQL): PromiseLike<unknown>; all(query: SQL): PromiseLike<readonly unknown[]>; };",
+      "jsdocSummary": "The least a database must offer: Drizzle's raw-SQL calls on an async SQLite driver, such as the `db` from `createLibsqlDb` (`@arki/db/libsql`). Its write queue then gives these statements their turn with the app's own writes. Pass the database, never a transaction handle: a rollback would undo an acquire and hand the same fence out twice."
+    },
+    {
+      "subpath": "./sqlite",
+      "name": "sqliteLeaseGuarantees",
+      "kind": "variable",
+      "signature": "export declare const sqliteLeaseGuarantees: { readonly kind: 'lease'; readonly scope: 'cluster'; readonly wait: 'poll'; readonly shared: false; readonly permits: true; readonly fence: 'durable'; readonly releasedOnCrash: 'after-ttl'; readonly clock: 'store'; readonly poolerSafe: true; readonly runtimes: readonly [\"node\", \"bun\", \"deno\"]; };",
+      "jsdocSummary": "What `sqliteLease(db, { ttl })` promises. Every client of the database is kept apart; waiters poll."
+    },
+    {
+      "subpath": "./sqlite",
+      "name": "SqliteLeaseGuarantees",
+      "kind": "type",
+      "signature": "export type SqliteLeaseGuarantees = typeof sqliteLeaseGuarantees;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./sqlite",
+      "name": "SqliteLeaseOptions",
+      "kind": "type",
+      "signature": "export type SqliteLeaseOptions = { /** How long the lease lasts without renewal. At least 1 s. */ readonly ttl: Duration; /** Default `arki_lock`. `name` or `schema.name` (an attached database). */ readonly table?: string; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./sqlite",
+      "name": "SqliteLeaseStore",
+      "kind": "type",
+      "signature": "export type SqliteLeaseStore = Store<SqliteLeaseGuarantees> & { readonly permits: PermitOps; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./testing",
+      "name": "CaseStore",
+      "kind": "type",
+      "signature": "export type CaseStore = { readonly store: Store; readonly advanceTime?: ContractOptions['advanceTime']; readonly ttl?: number; readonly scheduler?: Scheduler; };",
+      "jsdocSummary": "A store built for one case, with the hooks that belong to that store alone: its own clock, its own scheduler. A store whose clock is per case (an isolated table, a fresh manual scheduler) must return this form, so a case that timed out and keeps running never moves the next case's clock. Any field left out falls back to the fixed {@link ContractOptions}."
+    },
+    {
+      "subpath": "./testing",
+      "name": "chaos",
+      "kind": "function",
+      "signature": "export declare function chaos(makeStore: MakeStore, hooks: ChaosHooks, options?: ContractOptions): ContractCase[];",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./testing",
+      "name": "ChaosHooks",
+      "kind": "type",
+      "signature": "export type ChaosHooks = { /** Make the holder vanish without releasing, as a crash would. */ readonly killHolder?: (store: Store, grant: Grant) => Promise<void>; /** Make the next `count` renewals fail. */ readonly failRenewals?: (store: Store, count: number) => Promise<void>; /** Cut the connection a held lock is pinned to. */ readonly dropConnection?: (store: Store) => Promise<void>; /** Move the client's clock by `ms`; the store's clock must stay the judge. */ readonly skewClock?: (store: Store, ms: number) => Promise<void>; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./testing",
+      "name": "ContractCase",
+      "kind": "type",
+      "signature": "export type ContractCase = { readonly name: string; run(): Promise<void>; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./testing",
+      "name": "ContractOptions",
+      "kind": "type",
+      "signature": "export type ContractOptions = { /** Moves the store's clock (and the scheduler it shares) forward. Needed for lease expiry cases. */ readonly advanceTime?: (ms: number) => Promise<void>; /** The lease length to test with. Default: the store's own `ttlMs`. */ readonly ttl?: number; /** Callers in the race cases. `true` (default) = 16, `false` = skip the race cases. */ readonly concurrent?: boolean | { readonly callers: number; }; /** The scheduler the store was built with, handed to `createLocks`. */ readonly scheduler?: Scheduler; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./testing",
+      "name": "ContractSkip",
+      "kind": "class",
+      "signature": "export declare class ContractSkip extends Error { readonly name = \"ContractSkip\"; }",
+      "jsdocSummary": "Thrown by a case that does not apply to this store. `message` is the reason."
+    },
+    {
+      "subpath": "./testing",
+      "name": "describeCases",
+      "kind": "function",
+      "signature": "export declare function describeCases(name: string, cases: readonly ContractCase[]): void;",
+      "jsdocSummary": "Register cases with vitest; a case that throws {@link ContractSkip } is reported skipped with its reason."
+    },
+    {
+      "subpath": "./testing",
+      "name": "describeStoreContract",
+      "kind": "function",
+      "signature": "export declare function describeStoreContract(name: string, makeStore: MakeStore, options?: ContractOptions): void;",
+      "jsdocSummary": "`storeContract` wrapped in a vitest `describe`."
+    },
+    {
+      "subpath": "./testing",
+      "name": "MakeStore",
+      "kind": "type",
+      "signature": "export type MakeStore = () => Store | CaseStore | Promise<Store | CaseStore>;",
+      "jsdocSummary": "Builds a fresh store per case. Returns the bare store (fixed options) or a {@link CaseStore} (per-case hooks)."
+    },
+    {
+      "subpath": "./testing",
+      "name": "manualScheduler",
+      "kind": "function",
+      "signature": "export declare function manualScheduler(start?: number): ManualScheduler;",
+      "jsdocSummary": "`ref` is accepted and ignored: nothing here keeps a process alive."
+    },
+    {
+      "subpath": "./testing",
+      "name": "ManualScheduler",
+      "kind": "type",
+      "signature": "export type ManualScheduler = Scheduler & { /** * Move the clock forward. Fires every timer due on the way, in order, each * at its own time. Awaits a promise a callback returns (a renewal in flight), * then lets pending microtasks settle. The target is fixed when you call it. * Do not await it when a callback hangs on purpose. */ advance(duration: Duration): Promise<void>; /** How many timers are waiting to fire. */ readonly pendingTimers: number; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./testing",
+      "name": "MemoryEntry",
+      "kind": "type",
+      "signature": "export type MemoryEntry = { /** Mutex: the holder. Semaphore and readers: the earliest holder. */ readonly owner: LockToken; /** The newest fence handed out for this key. */ readonly fence: LockFence; readonly expiresAt?: number; /** Read/write keys: what the holders hold. */ readonly mode?: 'read' | 'write'; /** Semaphore keys: permits in use. */ readonly permits?: number; /** Semaphore and read keys: how many holds there are. */ readonly holders?: number; };",
+      "jsdocSummary": "What `peek` shows about a held key. A copy: changing it changes nothing."
+    },
+    {
+      "subpath": "./testing",
+      "name": "MemoryGuarantees",
+      "kind": "type",
+      "signature": "export type MemoryGuarantees = typeof memoryGuarantees;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./testing",
+      "name": "memoryStore",
+      "kind": "function",
+      "signature": "export declare function memoryStore(): MemoryStore;",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./testing",
+      "name": "MemoryStore",
+      "kind": "type",
+      "signature": "export type MemoryStore = Store<MemoryGuarantees, never> & { /** Resolves when the key is free (any primitive), or when `signal` aborts. */ waitFor(key: Key, signal: AbortSignal): Promise<void>; /** A mutex waiter: queued now, handed the lock by a release. */ waiter(key: Key): Waiter<never>; readonly permits: PermitOps<never> & { waiter(key: Key, weight: number): Waiter<never>; }; readonly shared: SharedOps<never> & { waiter(key: Key, mode: 'read' | 'write'): Waiter<never>; }; /** The current holder of `key`, if any. A lock reserved for a woken waiter has none yet. For tests and debugging. */ peek(key: Key): MemoryEntry | undefined; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./testing",
+      "name": "replicaCases",
+      "kind": "function",
+      "signature": "export declare function replicaCases(makeStore: MakeStore, options?: ReplicaOptions): ContractCase[];",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./testing",
+      "name": "ReplicaOptions",
+      "kind": "type",
+      "signature": "export type ReplicaOptions = { /** The clock the store was built with. Default: a fresh one (right for stores with no clock of their own). */ readonly scheduler?: ManualScheduler; /** fast-check runs. Default 50. */ readonly numRuns?: number; /** Fixed seed, to replay a failure. */ readonly seed?: number; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./testing",
+      "name": "storeContract",
+      "kind": "function",
+      "signature": "export declare function storeContract(makeStore: MakeStore, options?: ContractOptions): ContractCase[];",
+      "jsdocSummary": "The runner-agnostic cases. Run each `run()` yourself, or use `describeStoreContract`."
+    },
+    {
+      "subpath": "./testing",
+      "name": "testStore",
+      "kind": "function",
+      "signature": "export declare function testStore<G extends Guarantees>(guarantees: G, options?: TestStoreOptions): TestStore<G>;",
+      "jsdocSummary": "An in-memory store that keeps every promise `guarantees` makes. Pass the guarantees of the production store (`pgSessionGuarantees`, `pgLeasePollGuarantees`, ...) and the manager built on it has the production handle's type."
+    },
+    {
+      "subpath": "./testing",
+      "name": "TestStore",
+      "kind": "type",
+      "signature": "export type TestStore<G extends Guarantees> = Store<G, never> & { waitFor(key: Key, signal: AbortSignal): Promise<void>; waiter(key: Key): Waiter<never>; /** Stops the lease timers. */ dispose(): Promise<void>; } & (G['permits'] extends true ? { readonly permits: PermitOps<never>; } : unknown) & (G['shared'] extends true ? { readonly shared: SharedOps<never>; } : unknown);",
+      "jsdocSummary": "What `testStore(guarantees)` returns: a `Store<G, never>`, with the permits and shared ops when `G` claims them."
+    },
+    {
+      "subpath": "./testing",
+      "name": "TestStoreOptions",
+      "kind": "type",
+      "signature": "export type TestStoreOptions = { /** The clock and timers a lease expires on. Give the manager the same one. Default: the global timers. */ readonly scheduler?: Scheduler; /** Lease guarantees only: how long a lease lasts without renewal. Default `'30s'`. */ readonly ttl?: Duration; };",
+      "jsdocSummary": ""
+    },
+    {
+      "subpath": "./zod",
+      "name": "durationSchema",
+      "kind": "variable",
+      "signature": "export declare const durationSchema: z.ZodUnion<readonly [z.ZodNumber, z.ZodTemplateLiteral<`${number}h` | `${number}m` | `${number}ms` | `${number}s`>]>;",
+      "jsdocSummary": "A number of milliseconds, or a string with unit `ms`, `s`, `m` or `h`. No days or weeks on purpose."
+    },
+    {
+      "subpath": "./zod",
+      "name": "grantSchema",
+      "kind": "variable",
+      "signature": "export declare const grantSchema: z.ZodReadonly<z.ZodObject<{ key: z.ZodReadonly<z.ZodObject<{ namespace: z.ZodString; name: z.ZodString; full: z.ZodCustom<import(\"./identities.js\").LockKey, import(\"./identities.js\").LockKey>; }, z.core.$strip>>; token: z.core.$ZodBranded<z.ZodTemplateLiteral<string>, \"lock.owner\", \"out\">; fence: z.ZodOptional<z.ZodCustom<import(\"./identities.js\").LockFence, import(\"./identities.js\").LockFence>>; expiresAt: z.ZodOptional<z.ZodNumber>; conn: z.ZodOptional<z.ZodUnknown>; lost: z.ZodOptional<z.ZodCustom<Promise<LockError>, Promise<LockError>>>; }, z.core.$strip>>;",
+      "jsdocSummary": "What a store returns for a successful attempt."
+    },
+    {
+      "subpath": "./zod",
+      "name": "guaranteesSchema",
+      "kind": "variable",
+      "signature": "export declare const guaranteesSchema: z.ZodReadonly<z.ZodObject<{ kind: z.ZodEnum<{ hold: \"hold\"; lease: \"lease\"; }>; scope: z.ZodEnum<{ cluster: \"cluster\"; host: \"host\"; process: \"process\"; }>; wait: z.ZodEnum<{ native: \"native\"; none: \"none\"; poll: \"poll\"; wake: \"wake\"; }>; shared: z.ZodBoolean; permits: z.ZodBoolean; fence: z.ZodUnion<readonly [z.ZodEnum<{ \"best-effort\": \"best-effort\"; durable: \"durable\"; process: \"process\"; }>, z.ZodLiteral<false>]>; releasedOnCrash: z.ZodEnum<{ \"after-ttl\": \"after-ttl\"; immediate: \"immediate\"; }>; clock: z.ZodEnum<{ host: \"host\"; none: \"none\"; store: \"store\"; }>; poolerSafe: z.ZodBoolean; releasedBy: z.ZodOptional<z.ZodEnum<{ transaction: \"transaction\"; }>>; writerPreference: z.ZodOptional<z.ZodBoolean>; runtimes: z.ZodReadonly<z.ZodArray<z.ZodEnum<{ browser: \"browser\"; bun: \"bun\"; deno: \"deno\"; hermes: \"hermes\"; node: \"node\"; }>>>; }, z.core.$strip>>;",
+      "jsdocSummary": "What a store promises. The types of every handle derive from this."
+    },
+    {
+      "subpath": "./zod",
+      "name": "keyNameSchema",
+      "kind": "variable",
+      "signature": "export declare const keyNameSchema: z.ZodString;",
+      "jsdocSummary": "Validates the names that the canonical encoder accepts."
+    },
+    {
+      "subpath": "./zod",
+      "name": "keySchema",
+      "kind": "variable",
+      "signature": "export declare const keySchema: z.ZodReadonly<z.ZodObject<{ namespace: z.ZodString; name: z.ZodString; full: z.ZodCustom<import(\"./identities.js\").LockKey, import(\"./identities.js\").LockKey>; }, z.core.$strip>>;",
+      "jsdocSummary": "Canonical, length-delimited, versioned key. Built by `createKey`; see `key.ts`."
+    },
+    {
+      "subpath": "./zod",
+      "name": "limitSchema",
+      "kind": "variable",
+      "signature": "export declare const limitSchema: z.ZodNumber;",
+      "jsdocSummary": "A semaphore size: a positive integer."
+    },
+    {
+      "subpath": "./zod",
+      "name": "lockFenceSchema",
+      "kind": "variable",
+      "signature": "export declare const lockFenceSchema: z.ZodCustom<LockFence, LockFence>;",
+      "jsdocSummary": "Restores a generation read from its owning store."
+    },
+    {
+      "subpath": "./zod",
+      "name": "lockKeySchema",
+      "kind": "variable",
+      "signature": "export declare const lockKeySchema: z.ZodCustom<LockKey, LockKey>;",
+      "jsdocSummary": "Restores a versioned key identity without changing persisted bytes."
+    },
+    {
+      "subpath": "./zod",
+      "name": "lockTokenSchema",
+      "kind": "variable",
+      "signature": "export declare const lockTokenSchema: z.core.$ZodBranded<z.ZodTemplateLiteral<string>, \"lock.owner\", \"out\">;",
+      "jsdocSummary": "Restores an owner token; tokens intentionally have no backend-specific format."
+    },
+    {
+      "subpath": "./zod",
+      "name": "semaphoreConfigSchema",
+      "kind": "variable",
+      "signature": "export declare const semaphoreConfigSchema: z.ZodObject<{ limit: z.ZodNumber; }, z.core.$strip>;",
+      "jsdocSummary": "What `semaphore(key, config)` takes."
+    },
+    {
+      "subpath": "./zod",
+      "name": "storeTimeoutSchema",
+      "kind": "variable",
+      "signature": "export declare const storeTimeoutSchema: z.ZodNumber;",
+      "jsdocSummary": "`storeTimeout` in milliseconds, at least 1."
+    },
+    {
+      "subpath": "./zod",
+      "name": "weightSchema",
+      "kind": "variable",
+      "signature": "export declare const weightSchema: z.ZodNumber;",
+      "jsdocSummary": "How many permits one hold takes: a positive integer."
+    }
+  ],
+  "groups": [],
+  "errorCodes": [
+    "ARKI_LOCK_E002",
+    "ARKI_LOCK_E003",
+    "ARKI_LOCK_E004",
+    "ARKI_LOCK_E005",
+    "ARKI_LOCK_E006",
+    "ARKI_LOCK_E007",
+    "lock.aborted",
+    "lock.held",
+    "lock.lost",
+    "lock.release",
+    "lock.store"
+  ]
+}

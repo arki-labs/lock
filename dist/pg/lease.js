@@ -1,0 +1,512 @@
+import { observeLock } from '../telemetry.js';
+import { sql } from 'drizzle-orm';
+import { z } from 'zod';
+import { getLogger } from '@arki/log';
+import { lockFenceSchema } from '../identity-schemas.js';
+import { LockError, storeFailure } from '../errors.js';
+import { MIN_LEASE_TTL_MS } from '../locks.js';
+import { limitSchema, weightSchema } from '../schemas.js';
+import { parseDuration } from '../wait.js';
+import { DEFAULT_LEASE_TABLE, leaseTableSql, leaseUpgradeSql, tableIdentifier } from './lease.sql.js';
+export { DEFAULT_LEASE_TABLE, LEASE_TABLE_SQL, leaseTableSql, leaseUpgradeSql } from './lease.sql.js';
+const log = getLogger('arki:lock:pg-lease');
+/** The channel release notifies on. Payload = `key.full`. */
+const CHANNEL = 'arki_lock';
+const baseGuarantees = {
+    kind: 'lease',
+    scope: 'cluster',
+    shared: false,
+    permits: true,
+    fence: 'durable',
+    releasedOnCrash: 'after-ttl',
+    clock: 'store',
+    poolerSafe: true,
+    runtimes: ['node', 'bun', 'deno'],
+};
+/** What `pgLease(db, { ttl })` promises: waiters poll. */
+export const pgLeasePollGuarantees = { ...baseGuarantees, wait: 'poll' };
+/** What `pgLease(db, { ttl, listen })` promises: waiters wake on release. */
+export const pgLeaseWakeGuarantees = { ...baseGuarantees, wait: 'wake' };
+const acquireRowSchema = z.object({ generation: z.string(), expires_ms: z.string() });
+const freeRowSchema = z.object({ free: z.boolean() });
+const timestampRowSchema = z.object({ ts: z.string() });
+const notificationSchema = z.object({ channel: z.string(), payload: z.string().optional() });
+const resultRowsSchema = z.union([z.array(z.unknown()), z.object({ rows: z.array(z.unknown()) })]);
+function rowsOf(result) {
+    const parsed = resultRowsSchema.parse(result);
+    return Array.isArray(parsed) ? parsed : parsed.rows;
+}
+const limitRowSchema = z.object({ conflict: z.boolean() });
+const intervalMs = (ms) => sql `(${ms}::double precision) * interval '1 millisecond'`;
+/** Now, in ms since the epoch, from the database clock (never `now()`, which is the start of a transaction). */
+const NOW_MS = sql `(extract(epoch FROM clock_timestamp()) * 1000)`;
+/** The holders in `l.holders` whose lease has not run out. */
+const LIVE_HOLDERS = sql `(SELECT coalesce(jsonb_agg(h), '[]'::jsonb) FROM jsonb_array_elements(l.holders) AS h WHERE (h->>'e')::double precision > ${NOW_MS})`;
+const LIVE_WEIGHT = sql `(SELECT coalesce(sum((h->>'w')::integer), 0) FROM jsonb_array_elements(l.holders) AS h WHERE (h->>'e')::double precision > ${NOW_MS})`;
+/**
+ * Refuse a handle that runs inside one transaction. Two separate statements:
+ * in autocommit each is its own transaction, so `transaction_timestamp()`
+ * differs; inside a transaction block both return its start. The first sleeps
+ * 2 ms so a coarse database clock still moves between two autocommit statements.
+ */
+async function assertAutocommit(db) {
+    const first = await db.execute(sql `SELECT transaction_timestamp()::text AS ts FROM pg_sleep(0.002)`);
+    const second = await db.execute(sql `SELECT transaction_timestamp()::text AS ts`);
+    if (timestampRowSchema.parse(rowsOf(first)[0]).ts === timestampRowSchema.parse(rowsOf(second)[0]).ts) {
+        throw new LockError({
+            code: 'config',
+            message: 'pgLease needs an autocommit handle (a pool/db), not a transaction: a rollback would undo the acquire and repeat the fence',
+            remediation: 'Pass the pool or db, not the handle from db.transaction().',
+        });
+    }
+}
+/** Create the lease table if it is not there. Safe to call at every boot, from every replica at once. */
+export async function ensureLockTable(db, table = DEFAULT_LEASE_TABLE) {
+    return observeLock('store.ddl', async () => {
+        try {
+            const ddl = leaseTableSql(table);
+            // Two sessions running CREATE TABLE IF NOT EXISTS at once can both miss the
+            // table, and one then fails on pg_type. The lock makes the second one wait.
+            await db.execute(sql.raw(`DO $arki$ BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext('@arki/lock'), hashtext('${table}'));
+  ${ddl}
+  ${leaseUpgradeSql(table)}
+END $arki$`));
+            return;
+        }
+        catch (error) {
+            return storeFailure(error, 'ddl');
+        }
+    });
+}
+export function pgLease(db, options) {
+    const ttlMs = parseDuration(options.ttl);
+    if (!(ttlMs >= MIN_LEASE_TTL_MS)) {
+        throw new LockError({
+            code: 'config',
+            message: `lease ttl ${ttlMs} ms is below the renewal floor of ${MIN_LEASE_TTL_MS} ms`,
+            remediation: `Use a ttl of at least ${MIN_LEASE_TTL_MS} ms.`,
+        });
+    }
+    const table = tableIdentifier(options.table ?? DEFAULT_LEASE_TABLE);
+    // One probe per store, shared by concurrent first acquires. A refusal is
+    // kept (the handle will not change); a network failure is not, so it retries.
+    let autocommit;
+    const ensureAutocommit = () => {
+        autocommit ??= assertAutocommit(db).catch((error) => {
+            if (!(error instanceof LockError))
+                autocommit = undefined;
+            throw error;
+        });
+        return autocommit;
+    };
+    /**
+     * Semaphore protocol. One row per key; its live holders are inside the row (see `lease.sql.ts`).
+     * Every statement below changes that row, so Postgres locks it first and re-reads it before
+     * it checks the WHERE: the capacity test sees every grant already committed.
+     */
+    const permits = {
+        async acquire(key, req) {
+            return observeLock('store.acquire', async () => {
+                try {
+                    const { limit, weight, token } = req;
+                    if (!limitSchema.safeParse(limit).success || !weightSchema.safeParse(weight).success || weight > limit) {
+                        throw new LockError({
+                            code: 'config',
+                            message: `weight ${weight} and limit ${limit} must be positive integers with weight at most the limit`,
+                            remediation: 'Pass a positive integer weight of at most the limit.',
+                        });
+                    }
+                    await ensureAutocommit();
+                    const leaseMs = req.ttlMs ?? ttlMs;
+                    const holder = (fence) => sql `jsonb_build_object('t', ${token}::text, 'w', ${weight}::integer, 'f', ${fence}, 'e', ${NOW_MS} + ${leaseMs}::double precision)`;
+                    const result = await db.execute(sql `
+        INSERT INTO ${table} AS l (key, generation, expires_at, permits_limit, holders)
+        VALUES (${key.full}, 1, clock_timestamp() + ${intervalMs(leaseMs)}, ${limit}::integer,
+                jsonb_build_array(${holder(sql `1`)}))
+        ON CONFLICT (key) DO UPDATE
+          SET generation = l.generation + 1,
+              permits_limit = ${limit}::integer,
+              holders = ${LIVE_HOLDERS} || jsonb_build_array(${holder(sql `l.generation + 1`)})
+          WHERE ${LIVE_WEIGHT} + ${weight}::integer <= ${limit}::integer
+            AND (${LIVE_WEIGHT} = 0 OR l.permits_limit = ${limit}::integer)
+        RETURNING l.generation::text AS generation,
+                  floor((l.holders->-1->>'e')::double precision)::text AS expires_ms
+      `);
+                    const [row] = rowsOf(result);
+                    if (row !== undefined) {
+                        const parsed = acquireRowSchema.parse(row);
+                        return { key, token, fence: lockFenceSchema.parse(BigInt(parsed.generation)), expiresAt: Number(parsed.expires_ms) };
+                    }
+                    // Refused: full, or the limit disagrees with the holders'. Only the second is an error.
+                    const check = await db.execute(sql `
+        SELECT (${LIVE_WEIGHT} > 0 AND l.permits_limit IS DISTINCT FROM ${limit}::integer) AS conflict
+          FROM ${table} AS l WHERE l.key = ${key.full}
+      `);
+                    const [checked] = rowsOf(check);
+                    if (checked !== undefined && limitRowSchema.parse(checked).conflict) {
+                        throw new LockError({
+                            code: 'config',
+                            message: `the semaphore is held with a different limit than ${limit}`,
+                            remediation: 'Declare one limit per semaphore key; a new limit is accepted once no hold is left.',
+                        });
+                    }
+                    return;
+                }
+                catch (error) {
+                    return storeFailure(error, 'acquire');
+                }
+            });
+        },
+        async release(grant) {
+            return observeLock('store.release', async () => {
+                try {
+                    const result = await db.execute(sql `
+        WITH released AS (
+          UPDATE ${table} AS l
+            SET holders = (SELECT coalesce(jsonb_agg(h), '[]'::jsonb) FROM jsonb_array_elements(l.holders) AS h WHERE h->>'t' <> ${grant.token}::text)
+            WHERE l.key = ${grant.key.full}
+              AND EXISTS (SELECT 1 FROM jsonb_array_elements(l.holders) AS h WHERE h->>'t' = ${grant.token}::text)
+            RETURNING l.key
+        )
+        SELECT pg_notify(${CHANNEL}, key) FROM released
+      `);
+                    return rowsOf(result).length > 0 ? 'released' : 'not-owner';
+                }
+                catch (error) {
+                    return storeFailure(error, 'release');
+                }
+            });
+        },
+        async extend(grant, extendMs) {
+            return observeLock('store.extend', async () => {
+                try {
+                    const result = await db.execute(sql `
+        UPDATE ${table} AS l
+          SET holders = (
+            SELECT jsonb_agg(CASE WHEN h->>'t' = ${grant.token}::text
+                                  THEN jsonb_set(h, '{e}', to_jsonb(${NOW_MS} + ${extendMs}::double precision))
+                                  ELSE h END)
+              FROM jsonb_array_elements(l.holders) AS h)
+          WHERE l.key = ${grant.key.full}
+            AND EXISTS (SELECT 1 FROM jsonb_array_elements(l.holders) AS h
+                         WHERE h->>'t' = ${grant.token}::text AND (h->>'e')::double precision > ${NOW_MS})
+          RETURNING 1 AS ok
+      `);
+                    return rowsOf(result).length > 0;
+                }
+                catch (error) {
+                    return storeFailure(error, 'extend');
+                }
+            });
+        },
+    };
+    const shared = {
+        name: 'pg-lease',
+        permits,
+        ttlMs,
+        async acquire(key, req) {
+            return observeLock('store.acquire', async () => {
+                try {
+                    await ensureAutocommit();
+                    const leaseMs = req.ttlMs ?? ttlMs;
+                    const result = await db.execute(sql `
+        INSERT INTO ${table} AS lease (key, token, generation, expires_at)
+        VALUES (${key.full}, ${req.token}, 1, clock_timestamp() + ${intervalMs(leaseMs)})
+        ON CONFLICT (key) DO UPDATE
+          SET token = ${req.token},
+              generation = lease.generation + 1,
+              expires_at = clock_timestamp() + ${intervalMs(leaseMs)}
+          WHERE lease.token IS NULL OR lease.expires_at <= clock_timestamp()
+        RETURNING lease.generation::text AS generation,
+                  floor(extract(epoch FROM lease.expires_at) * 1000)::text AS expires_ms
+      `);
+                    const [row] = rowsOf(result);
+                    if (row === undefined)
+                        return;
+                    const parsed = acquireRowSchema.parse(row);
+                    return { key, token: req.token, fence: lockFenceSchema.parse(BigInt(parsed.generation)), expiresAt: Number(parsed.expires_ms) };
+                }
+                catch (error) {
+                    return storeFailure(error, 'acquire');
+                }
+            });
+        },
+        async release(grant) {
+            return observeLock('store.release', async () => {
+                try {
+                    // The row stays: `generation` must survive. Notify so waiters wake at once.
+                    const result = await db.execute(sql `
+        WITH released AS (
+          UPDATE ${table}
+            SET token = NULL, expires_at = clock_timestamp()
+            WHERE key = ${grant.key.full} AND token = ${grant.token}
+            RETURNING key
+        )
+        SELECT pg_notify(${CHANNEL}, key) FROM released
+      `);
+                    return rowsOf(result).length > 0 ? 'released' : 'not-owner';
+                }
+                catch (error) {
+                    return storeFailure(error, 'release');
+                }
+            });
+        },
+        async extend(grant, extendMs) {
+            return observeLock('store.extend', async () => {
+                try {
+                    const result = await db.execute(sql `
+        UPDATE ${table}
+          SET expires_at = clock_timestamp() + ${intervalMs(extendMs)}
+          WHERE key = ${grant.key.full} AND token = ${grant.token} AND expires_at > clock_timestamp()
+          RETURNING 1 AS ok
+      `);
+                    return rowsOf(result).length > 0;
+                }
+                catch (error) {
+                    return storeFailure(error, 'extend');
+                }
+            });
+        },
+    };
+    /** True when `weight` more permits fit on `key` now (no row, no live holder, or room left). */
+    const fits = async (key, weight) => {
+        const result = await db.execute(sql `
+      SELECT NOT EXISTS (
+        SELECT 1 FROM ${table} AS l
+         WHERE l.key = ${key.full} AND ${LIVE_WEIGHT} > 0 AND ${LIVE_WEIGHT} + ${weight}::integer > l.permits_limit
+      ) AS free
+    `);
+        return freeRowSchema.parse(rowsOf(result)[0]).free;
+    };
+    const withWaiter = (wake) => ({
+        ...permits,
+        waiter: (key, weight) => permitWaiter(() => fits(key, weight), wake && ((signal, ready) => wake(key, signal, ready))),
+    });
+    if (!('listen' in options))
+        return { ...shared, permits: withWaiter(), guarantees: pgLeasePollGuarantees };
+    const isFree = async (key) => {
+        const result = await db.execute(sql `
+      SELECT NOT EXISTS (
+        SELECT 1 FROM ${table} AS l
+         WHERE l.key = ${key.full}
+           AND ((l.token IS NOT NULL AND l.expires_at > clock_timestamp())
+                OR (l.permits_limit IS NOT NULL AND ${LIVE_WEIGHT} >= l.permits_limit))
+      ) AS free
+    `);
+        return freeRowSchema.parse(rowsOf(result)[0]).free;
+    };
+    const { waitReady, ...rest } = listener(options.listen);
+    return {
+        ...shared,
+        permits: withWaiter(waitReady),
+        guarantees: pgLeaseWakeGuarantees,
+        ...rest,
+        waitFor: async (key, signal) => {
+            try {
+                await waitReady(key, signal, () => isFree(key));
+                return;
+            }
+            catch (error) {
+                return storeFailure(error, 'waitFor');
+            }
+        },
+    };
+}
+const WAITER_FIRST_BEAT_MS = 100;
+const WAITER_MAX_BEAT_MS = 1000;
+/** Sleep `ms`, or until `signal` aborts or `cancel` runs. */
+function napUntil(ms, signal) {
+    const done = deferredVoid();
+    const timer = setTimeout(() => {
+        cancel();
+    }, ms);
+    function cancel() {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', cancel);
+        done.resolve();
+    }
+    if (signal.aborted)
+        cancel();
+    else
+        signal.addEventListener('abort', cancel, { once: true });
+    return { promise: done.promise, cancel };
+}
+function deferredVoid() {
+    const settlers = {};
+    const promise = new Promise(resolve => {
+        settlers.resolve = resolve;
+    });
+    return { promise, resolve: () => settlers.resolve?.() };
+}
+/**
+ * One caller's wait on a semaphore key. Resolves at once if the caller would fit now. Otherwise
+ * it sleeps until a release wakes it (LISTEN mode) or a beat that grows from 100 ms to 1 s ends:
+ * the beat also catches a holder that crashed and simply expired, which sends no NOTIFY.
+ */
+function permitWaiter(fitsNow, wake) {
+    let beat = WAITER_FIRST_BEAT_MS;
+    const closed = new AbortController();
+    return {
+        async waitFor(signal) {
+            return observeLock('store.waitFor', async () => {
+                try {
+                    if (signal.aborted || closed.signal.aborted || (await fitsNow()))
+                        return;
+                    const both = new AbortController();
+                    const stop = () => both.abort();
+                    signal.addEventListener('abort', stop, { once: true });
+                    closed.signal.addEventListener('abort', stop, { once: true });
+                    const nap = napUntil(beat, both.signal);
+                    beat = Math.min(beat * 2, WAITER_MAX_BEAT_MS);
+                    try {
+                        await Promise.race([nap.promise, wake?.(both.signal, fitsNow) ?? nap.promise]);
+                    }
+                    finally {
+                        nap.cancel();
+                        both.abort();
+                        signal.removeEventListener('abort', stop);
+                        closed.signal.removeEventListener('abort', stop);
+                    }
+                    return;
+                }
+                catch (error) {
+                    return storeFailure(error, 'waitFor');
+                }
+            });
+        },
+        close() {
+            closed.abort();
+        },
+    };
+}
+/** `waitReady` (wait for a release, or until `ready()` holds) and `dispose` over one lazily opened LISTEN connection, shared by every waiter. */
+function listener(connect) {
+    const waiters = new Map();
+    let connection;
+    let disposed = false;
+    const wakeAll = () => {
+        for (const set of waiters.values())
+            for (const wake of set)
+                wake();
+    };
+    const open = () => {
+        if (disposed)
+            return Promise.reject(new Error('the lease store was disposed'));
+        // One connection for every waiter: a connection per wait would drain the pool.
+        if (connection !== undefined)
+            return connection;
+        const attempt = (async () => {
+            const client = await connect();
+            let dropped = false;
+            const drop = () => {
+                if (dropped)
+                    return;
+                dropped = true;
+                if (connection === attempt)
+                    connection = undefined;
+                try {
+                    client.release(true);
+                }
+                catch (error) {
+                    log.debug('releasing the LISTEN connection failed: {error}', { error: String(error) });
+                }
+                // Waiters retry at once; the next waitFor opens a fresh connection.
+                wakeAll();
+            };
+            client.on('notification', (message) => {
+                const parsed = notificationSchema.safeParse(message);
+                if (!parsed.success || parsed.data.channel !== CHANNEL || parsed.data.payload === undefined)
+                    return;
+                for (const wake of waiters.get(parsed.data.payload) ?? [])
+                    wake();
+            });
+            client.on('error', drop);
+            client.on('end', drop);
+            try {
+                await client.query(`LISTEN ${CHANNEL}`);
+            }
+            catch (error) {
+                drop();
+                throw error;
+            }
+            log.debug('listening on {channel}', { channel: CHANNEL });
+            return client;
+        })();
+        connection = attempt;
+        // A failed connect is not kept, so the next wait tries again.
+        attempt.catch(() => {
+            if (connection === attempt)
+                connection = undefined;
+        });
+        return attempt;
+    };
+    return {
+        async waitReady(key, signal, ready) {
+            if (signal.aborted)
+                return;
+            const set = waiters.get(key.full) ?? new Set();
+            waiters.set(key.full, set);
+            let settle;
+            const promise = new Promise(resolveWait => {
+                settle = resolveWait;
+            });
+            let woken = false;
+            const done = () => {
+                if (woken)
+                    return;
+                woken = true;
+                signal.removeEventListener('abort', done);
+                set.delete(done);
+                if (set.size === 0 && waiters.get(key.full) === set)
+                    waiters.delete(key.full);
+                settle?.();
+            };
+            set.add(done);
+            signal.addEventListener('abort', done, { once: true });
+            try {
+                // Listen first, check after: a release before LISTEN took effect is caught
+                // by the check, one after it by the notification. Raced with the wake-up
+                // so an abort never waits for a slow connect.
+                const listening = await Promise.race([open().then(() => true), promise.then(() => false)]);
+                if (listening && (await ready()))
+                    done();
+            }
+            catch (error) {
+                done();
+                throw error;
+            }
+            await promise;
+        },
+        async dispose() {
+            return observeLock('store.dispose', async () => {
+                if (disposed)
+                    return;
+                disposed = true;
+                const pending = connection;
+                connection = undefined;
+                wakeAll();
+                if (pending === undefined)
+                    return;
+                let client;
+                try {
+                    client = await pending;
+                }
+                catch {
+                    // The connection never opened, or a connection error already released it. Nothing is left to release,
+                    // and the waiter that asked for it already got the error.
+                    return;
+                }
+                try {
+                    client.release(true);
+                }
+                catch (error) {
+                    // The LISTEN connection could not be released, so it may still hold a pool slot.
+                    return storeFailure(error, 'dispose');
+                }
+                return;
+            });
+        },
+    };
+}
+//# sourceMappingURL=lease.js.map

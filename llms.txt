@@ -1,0 +1,38 @@
+# @arki/lock
+
+> Distributed locks and semaphores for TypeScript. One API over memory, Postgres, SQLite, Redis and file stores. A busy lock is a returned failure, not a throw. It keeps jobs apart; it does not make a write safe on its own.
+
+## Import paths
+<!-- llms:start -->
+- `@arki/lock`: distributed locks and semaphores over any store; a busy lock is a returned failure. `LOCK_COUNTER_NAMES`, `LOCK_ERROR_CODES`, `LOCK_FAILURES`, `LOCK_RUN_FAILURES`, `LockAborted`, `LockError`, `LockHeld`, `LockLost`, `LockReleaseFailed`, `LockStoreFailure`, `createLocks`; types `AcquireRequest`; and 41 more.
+- `@arki/lock/memory`: In-process hold store: mutex, counting semaphore and read/write locks. `memoryGuarantees`, `memoryStore`; types `MemoryEntry`, `MemoryGuarantees`, `MemoryStore`.
+- `@arki/lock/pg`: `HOLD_BEAT_SECONDS`, `HOLD_BEAT_TIMEOUT_MS`, `HOLD_FIRST_BEAT_SECONDS`, `WAIT_SLICE_MS`, `pgSession`, `pgSessionGuarantees`, `pgTransaction`, `pgTransactionGuarantees`; types `LockableDb`, `PgExecutor`, `PgLockOptions`, `PgSessionGuarantees`; and 2 more.
+- `@arki/lock/pg/lease`: `DEFAULT_LEASE_TABLE`, `LEASE_TABLE_SQL`, `ensureLockTable`, `leaseTableSql`, `leaseUpgradeSql`, `pgLease`, `pgLeasePollGuarantees`, `pgLeaseWakeGuarantees`; types `LeaseDb`, `ListenClient`, `PgLeaseListenOptions`, `PgLeaseOptions`; and 3 more.
+- `@arki/lock/sqlite`: `DEFAULT_LEASE_TABLE`, `LEASE_TABLE_SQL`, `ensureLockTable`, `leaseTableSql`, `sqliteLease`, `sqliteLeaseGuarantees`; types `SqliteLeaseDb`, `SqliteLeaseGuarantees`, `SqliteLeaseOptions`, `SqliteLeaseStore`.
+- `@arki/lock/redis`: `redisGuarantees`, `redisKeys`, `redisStore`; types `RedisGuarantees`, `RedisStore`, `RedisStoreOptions`.
+- `@arki/lock/file`: `fileGuarantees`, `fileStore`; types `FileGuarantees`, `FileStore`, `FileStoreOptions`.
+- `@arki/lock/dot`: `locks(...)` — the lock manager as a Dot unit. `describeLocks`, `locks`; types `LocksDescription`, `LocksPluginOptions`.
+- `@arki/lock/testing`: a manual scheduler, an in-memory store with any store's guarantees, the store conformance suite, chaos hooks and the replica property. `ContractSkip`, `chaos`, `describeCases`, `describeStoreContract`, `manualScheduler`, `memoryStore`, `replicaCases`, `storeContract`, `testStore`; types `CaseStore`, `ChaosHooks`, `ContractCase`; and 9 more.
+- `@arki/lock/zod`: Canonical parsers for persisted lock identities. `durationSchema`, `grantSchema`, `guaranteesSchema`, `keyNameSchema`, `keySchema`, `limitSchema`, `lockFenceSchema`, `lockKeySchema`, `lockTokenSchema`, `semaphoreConfigSchema`, `storeTimeoutSchema`, `weightSchema`.
+<!-- llms:end -->
+
+## Start here
+- [Agent guide](docs/agent-guide.md): read first.
+- [Verify](docs/agent-guide.md#verify): the commands to run after a change.
+- [README](README.md): the long overview.
+
+## By task
+- [Run a job once at a time](docs/agent-guide.md#run-a-job-once-at-a-time)
+- [Wait for the lock](docs/agent-guide.md#wait-for-the-lock)
+- [Limit concurrency](docs/agent-guide.md#limit-concurrency)
+- [Protect a write that cannot be undone](docs/agent-guide.md#protect-a-write-that-cannot-be-undone)
+- [Elect a leader](docs/agent-guide.md#elect-a-leader)
+- [Wire it into a Dot app](docs/agent-guide.md#wire-it-into-a-dot-app)
+- [Test a multi-replica job](docs/agent-guide.md#test-a-multi-replica-job)
+
+## Rules that bite
+- A busy lock is the returned `LockHeld` failure. Check `LockHeld.is(result)`.
+- Operational failures are returned. Configuration/misuse throw `LockError`; callback defects return `UnexpectedDefect` with private cause.
+- Completed callback results survive cleanup failure; manual release returns `LockReleaseFailed`. Never infer replay safety from loss or cleanup uncertainty.
+- Pass `ctx.signal` to your work. Loss of the lock aborts it.
+- Fence irreversible writes. The lock alone does not stop a late write.

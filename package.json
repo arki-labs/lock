@@ -1,0 +1,139 @@
+{
+  "name": "@arki/lock",
+  "version": "0.2.1",
+  "description": "Distributed locks and semaphores — one API over memory, Postgres, SQLite, Redis and file stores, with fencing-safe leases, bounded waits and abort signals.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arki-labs/arki.git"
+  },
+  "homepage": "https://arki.dev",
+  "bugs": {
+    "url": "https://github.com/arki-labs/arki/issues"
+  },
+  "keywords": [
+    "arki",
+    "typescript",
+    "lock",
+    "mutex",
+    "semaphore",
+    "distributed-lock",
+    "advisory-lock",
+    "postgres",
+    "sqlite",
+    "redis"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./memory": {
+      "types": "./dist/memory.d.ts",
+      "import": "./dist/memory.js",
+      "default": "./dist/memory.js"
+    },
+    "./pg": {
+      "types": "./dist/pg/index.d.ts",
+      "import": "./dist/pg/index.js",
+      "default": "./dist/pg/index.js"
+    },
+    "./pg/lease": {
+      "types": "./dist/pg/lease.d.ts",
+      "import": "./dist/pg/lease.js",
+      "default": "./dist/pg/lease.js"
+    },
+    "./sqlite": {
+      "types": "./dist/sqlite/index.d.ts",
+      "import": "./dist/sqlite/index.js",
+      "default": "./dist/sqlite/index.js"
+    },
+    "./redis": {
+      "types": "./dist/redis/index.d.ts",
+      "import": "./dist/redis/index.js",
+      "default": "./dist/redis/index.js"
+    },
+    "./file": {
+      "types": "./dist/file/index.d.ts",
+      "import": "./dist/file/index.js",
+      "default": "./dist/file/index.js"
+    },
+    "./dot": {
+      "types": "./dist/dot/index.d.ts",
+      "import": "./dist/dot/index.js",
+      "default": "./dist/dot/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js",
+      "default": "./dist/testing/index.js"
+    },
+    "./package.json": "./package.json",
+    "./zod": {
+      "types": "./dist/zod.d.ts",
+      "import": "./dist/zod.js",
+      "default": "./dist/zod.js"
+    }
+  },
+  "files": [
+    "dist/**",
+    "src/**",
+    "!src/**/*.test.*",
+    "!src/**/*.spec.*",
+    "!src/**/__tests__/**",
+    "docs/**",
+    "llms.txt",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "dependencies": {
+    "@arki/clock": "0.2.0",
+    "@arki/contracts": "0.4.1",
+    "@arki/failure": "0.3.0",
+    "@arki/log": "0.4.0",
+    "@arki/schema": "0.3.0",
+    "@opentelemetry/api": "^1.9.1",
+    "zod": "4.6.5"
+  },
+  "peerDependencies": {
+    "@arki/dot": "^0.10.0",
+    "drizzle-orm": "^1.0.0-rc.4",
+    "fast-check": "^4.10.2",
+    "ioredis": "^5.11.1",
+    "vitest": "^5.0.3"
+  },
+  "peerDependenciesMeta": {
+    "@arki/dot": {
+      "optional": true
+    },
+    "drizzle-orm": {
+      "optional": true
+    },
+    "fast-check": {
+      "optional": true
+    },
+    "ioredis": {
+      "optional": true
+    },
+    "vitest": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "arki": {
+    "runtimes": [
+      "node",
+      "bun",
+      "deno",
+      "browser",
+      "hermes"
+    ]
+  }
+}
