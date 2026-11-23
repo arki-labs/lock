@@ -1,5 +1,5 @@
 import { context, metrics, SpanStatusCode, trace } from '@opentelemetry/api';
-import { isFailure, UnexpectedDefect } from '@arki/failure';
+import { isFailure, isFault, UnexpectedDefect } from '@arki/failure';
 /** Reporting must never change ownership, replay execution, or reject unobserved. */
 export function report(observe) {
     try {
@@ -35,7 +35,9 @@ export async function observeLock(operation, execute) {
         if (isFailure(result)) {
             code = result.code === 'lock.held' ? 'held' : UnexpectedDefect.is(result) ? 'defect' : 'failure';
             report(() => span?.setAttribute('failure.code', result.code));
-            report(() => span?.setStatus({ code: SpanStatusCode.ERROR }));
+            // A held lock (409) is an answer, not a fault: only a 5xx sets error status.
+            if (isFault(result))
+                report(() => span?.setStatus({ code: SpanStatusCode.ERROR }));
         }
         return result;
     }

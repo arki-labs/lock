@@ -1,4 +1,4 @@
-Read-only mirror of `@arki/lock` v0.2.1. Source and issues: arki-labs/arki. Docs: https://arki.dev/packages/lock. Published 2026-11-02 with provenance https://www.npmjs.com/package/@arki/lock/v/0.2.1#provenance.
+Read-only mirror of `@arki/lock` v0.2.2. Source and issues: arki-labs/arki. Docs: https://arki.dev/packages/lock. Published 2026-11-23 with provenance https://www.npmjs.com/package/@arki/lock/v/0.2.2#provenance.
 
 # @arki/lock
 
@@ -68,6 +68,18 @@ export async function overlap() {
 ## Runtime support
 
 Node, Bun and Deno. The memory store also runs in browsers and on Hermes. The Postgres, SQLite, Redis and file stores need their client and a server runtime.
+
+Lock tokens come from Web Crypto `getRandomValues`. React Native has none, so install `react-native-get-random-values` and import it before `@arki/lock`. Without it every lock call fails closed with `RandomSourceUnavailable` from `@arki/contracts`, and the callback does not run.
+
+<!-- runtimes:start -->
+| Runtime | Result | Version tested | Date (UTC) |
+| --- | --- | --- | --- |
+| node | pass | v22.13.1 | 2026-11-05 |
+| bun | pass | 1.4.2 | 2026-11-05 |
+| deno | pass | 2.9.8 | 2026-11-05 |
+| browser | pass | Chromium 156.0.8078.4 | 2026-11-05 |
+| hermes | pass | V1 250829098.0.17 | 2026-11-05 |
+<!-- runtimes:end -->
 
 ## Public imports
 
@@ -832,6 +844,25 @@ it('runs the job once while another run holds the key', async () => {
 ```
 
 For a `pgLease` service, pass `pgLeasePollGuarantees` (and the same `ttl`): the fake then has `lead` and `semaphore`, and its leases run out when you `advance` the clock past the ttl without renewing.
+
+## Observability
+
+Spans (OpenTelemetry API only, tracer `@arki/lock`; nothing is exported until the app configures an SDK):
+
+| Span | When | Attributes |
+| --- | --- | --- |
+| `lock.run`, `lock.try_run` | each manager `run` / `tryRun`, from the wait to the release | `failure.code` on failure |
+| `lock.acquire`, `lock.try_acquire` | each manual `acquire` / `tryAcquire` | `failure.code` on failure |
+| `lock.extend`, `lock.release` | each guard `extend` / `release` | `failure.code` on failure |
+| `lock.lead` | each `lead(...)` leadership loop | `failure.code` on failure |
+| `lock.store.acquire`, `lock.store.release`, `lock.store.extend` | each backend call of the Postgres, lease, SQLite, Redis and file stores | `failure.code` on failure |
+| `lock.store.waitFor`, `lock.store.dispose`, `lock.store.ddl` | each backend wait, store close and table setup (where the store has one) | `failure.code` on failure |
+
+`lock.held` (409) is an answer: it sets `failure.code` and leaves the status unset. Only a fault (5xx) or a throw sets error status. Spans start under the active context: in a Dot app, a lock a usecase takes nests under the `feature.<feature>.<usecase>` span. No span carries a key, token, fence or callback payload.
+
+Metrics: `lock.operations` (counter; `operation`, `outcome`: `success`, `held`, `failure` or `defect`).
+
+Not instrumented: the memory store and key functions — in-process maps and pure computation, with no backend call to wait on.
 
 ## Limits
 
